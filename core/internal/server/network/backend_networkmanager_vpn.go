@@ -471,7 +471,7 @@ func detectVPNAuthAction(serviceType string, data map[string]string) string {
 				log.Infof("[VPN] External browser auth detected for protocol '%s' but only GlobalProtect (gp) and Fortinet are currently supported", protocol)
 			}
 		}
-		if protocol == "fortinet" && data["authtype"] == "password" {
+		if data["authtype"] == "password" {
 			return "openconnect_password"
 		}
 	case strings.Contains(serviceType, "openvpn"):

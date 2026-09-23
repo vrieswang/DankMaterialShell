@@ -148,8 +148,9 @@ func runOpenConnectPasswordAuth(
 	data map[string]string,
 	username, password, serverCert string,
 ) (*openConnectAuthResult, error) {
-	if data["protocol"] != "fortinet" {
-		return nil, fmt.Errorf("only Fortinet password authentication is supported")
+	protocol := data["protocol"]
+	if protocol == "" {
+		return nil, fmt.Errorf("OpenConnect protocol is empty")
 	}
 	gateway := data["gateway"]
 	if gateway == "" {
@@ -160,7 +161,7 @@ func runOpenConnectPasswordAuth(
 	}
 
 	args := []string{
-		"--protocol=fortinet",
+		"--protocol=" + protocol,
 		"--user=" + username,
 		"--passwd-on-stdin",
 		"--non-inter",

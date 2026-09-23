@@ -141,17 +141,25 @@ func TestNetworkManagerBackend_UpdateVPNConnectionState_EmptyUUID(t *testing.T) 
 	})
 }
 
-func TestDetectVPNAuthAction_Fortinet(t *testing.T) {
+func TestDetectVPNAuthAction_OpenConnectPassword(t *testing.T) {
 	service := "org.freedesktop.NetworkManager.openconnect"
 
+	// Fortinet keeps routing through the pre-auth path (regression guard).
 	assert.Equal(t, "openconnect_password", detectVPNAuthAction(service, map[string]string{
 		"protocol": "fortinet",
 		"authtype": "password",
 	}))
-	assert.Empty(t, detectVPNAuthAction(service, map[string]string{
-		"protocol": "anyconnect",
-		"authtype": "password",
-	}))
+
+	// AnyConnect and other openconnect protocols also route through pre-auth so
+	// the shared cert-rotation flow in handleOpenConnectPasswordAuth runs.
+	for _, protocol := range []string{"anyconnect", "juniper-ssl", "cisco"} {
+		assert.Equal(t, "openconnect_password", detectVPNAuthAction(service, map[string]string{
+			"protocol": protocol,
+			"authtype": "password",
+		}), "protocol=%q", protocol)
+	}
+
+	// SAML is still handled by the external-browser path.
 	assert.Equal(t, "fortinet_saml", detectVPNAuthAction(service, map[string]string{
 		"protocol": "fortinet",
 		"authtype": "saml",
@@ -159,6 +167,12 @@ func TestDetectVPNAuthAction_Fortinet(t *testing.T) {
 	assert.Equal(t, "fortinet_saml", detectVPNAuthAction(service, map[string]string{
 		"protocol":         "fortinet",
 		"saml-auth-method": "REDIRECT",
+	}))
+
+	// Non-password authtypes without SAML still fall through to no pre-auth.
+	assert.Empty(t, detectVPNAuthAction(service, map[string]string{
+		"protocol": "anyconnect",
+		"authtype": "cert",
 	}))
 }
 
@@ -277,4 +291,70 @@ exit 1
 	}, backend.pendingVPNSave.PersistentSecrets)
 	assert.False(t, backend.pendingVPNSave.SavePassword)
 	assert.Empty(t, backend.pendingVPNSave.Secrets)
+}
+
+func TestOpenConnectCertificateConfirmation_AnyConnect(t *testing.T) {
+	// AnyConnect uses a different protocol string and typically a different
+	// gateway port. The cert-rotation branch in handleOpenConnectPasswordAuth
+	// must be protocol-agnostic, and runOpenConnectPasswordAuth must forward
+	// the actual --protocol= value instead of hardcoding fortinet.
+	binDir := t.TempDir()
+	openConnectPath := filepath.Join(binDir, "openconnect")
+	script := `#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    --protocol=anyconnect) echo PROTOCOL_ANYCONNECT ;;
+    --servercert=pin-sha256:ANY-CONNECT-PIN) echo SERVERCERT_PIN ;;
+  esac
+done
+case "$*" in
+  *--protocol=anyconnect*--servercert=pin-sha256:ANY-CONNECT-PIN*)
+    printf '%s\n' "COOKIE='vpn_cookie=abc'" "HOST='vpn.example.test'" "FINGERPRINT='pin-sha256:ANY-CONNECT-PIN'"
+    exit 0
+    ;;
+  *--protocol=anyconnect*)
+    printf '%s\n' 'Add --servercert pin-sha256:ANY-CONNECT-PIN' >&2
+    exit 1
+    ;;
+esac
+printf '%s\n' 'unexpected arguments: $*' >&2
+exit 1
+`
+	assert.NoError(t, os.WriteFile(openConnectPath, []byte(script), 0o755))
+	t.Setenv("PATH", binDir)
+
+	conn := mock_gonetworkmanager.NewMockConnection(t)
+	connPath := dbus.ObjectPath("/org/freedesktop/NetworkManager/Settings/999")
+	conn.EXPECT().GetSecrets("vpn").Return(gonetworkmanager.ConnectionSettings{
+		"vpn": {"secrets": map[string]string{"password": "test-password"}},
+	}, nil)
+	conn.EXPECT().GetPath().Return(connPath).Twice()
+
+	broker := &fakePromptBroker{
+		asked: make(chan PromptRequest, 1),
+		reply: PromptReply{},
+	}
+	backend := &NetworkManagerBackend{promptBroker: broker}
+	data := map[string]string{
+		"gateway":  "vpn.example.test:64433",
+		"protocol": "anyconnect",
+		"authtype": "password",
+		"username": "test-user",
+	}
+
+	result, err := backend.handleOpenConnectPasswordAuth(
+		context.Background(), conn, "Test VPN", "test-uuid",
+		"org.freedesktop.NetworkManager.openconnect", data,
+	)
+	assert.NoError(t, err)
+	assert.Equal(t, "vpn_cookie=abc", result.Cookie)
+	assert.Equal(t, "vpn.example.test:64433", result.Host)
+
+	prompt := <-broker.asked
+	assert.Equal(t, "server-certificate", prompt.Reason)
+	assert.Equal(t, []string{"pin-sha256:ANY-CONNECT-PIN"}, prompt.Hints)
+
+	assert.Equal(t, map[string]string{
+		"certificate:vpn.example.test:64433": "pin-sha256:ANY-CONNECT-PIN",
+	}, backend.pendingVPNSave.PersistentSecrets)
 }
